@@ -1,0 +1,47 @@
+[tool.poetry]
+name = "ai-communication-app"
+version = "0.1.0"
+description = "AI English conversation app using SeamlessM4T v2 Speech-to-Speech"
+authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+packages = [{include = "ai_communication_app", from = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+streamlit = "^1.35.0"
+torch = "^2.0.0"
+torchaudio = "^2.0.0"
+sounddevice = "^0.4.6"
+pydub = "^0.25.1"
+loguru = "^0.7.0"
+requests = "^2.31.0"
+numpy = "^1.24.0"
+transformers = "^4.30.0"
+speechrecognition = "^3.14.3"
+pyttsx3 = "^2.99"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+pytest-asyncio = "^0.21.0"
+black = "^23.7.0"
+isort = "^5.12.0"
+flake8 = "^6.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+asyncio_mode = "auto"
