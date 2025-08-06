@@ -1,0 +1,32 @@
+# FastAPI Backend Dockerfile - 統合APIゲートウェイ
+FROM python:3.11-slim
+
+# システム依存関係
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Backend用の依存関係
+COPY requirements/backend.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# アプリケーションコード
+COPY backend/ ./backend/
+
+# ログディレクトリ
+RUN mkdir -p /app/logs
+
+# 環境変数
+ENV PYTHONPATH=/app
+
+# ポート公開
+EXPOSE 8000
+
+# ヘルスチェック
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# uvicornで起動
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

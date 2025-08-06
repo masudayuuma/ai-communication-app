@@ -1,0 +1,34 @@
+# Whisper ASRサービス用 Dockerfile
+FROM python:3.11-slim
+
+# 基本パッケージのインストール
+RUN apt-get update && apt-get install -y \
+    curl \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python環境設定
+RUN pip install --upgrade pip
+
+# 作業ディレクトリ
+WORKDIR /app
+
+# Whisper関連の依存関係
+COPY requirements/whisper.txt /app/requirements.txt
+RUN pip install -r requirements.txt
+
+# アプリケーションコードをコピー
+COPY services/whisper/ /app/
+
+# モデルディレクトリ作成
+RUN mkdir -p /models
+
+# ポート開放
+EXPOSE 8001
+
+# ヘルスチェック
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8001/health || exit 1
+
+# アプリケーション起動
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]

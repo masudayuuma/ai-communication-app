@@ -1,0 +1,8 @@
+fastapi==0.111.0
+uvicorn[standard]==0.25.0
+faster-whisper==1.0.0
+redis==5.0.1
+numpy==1.24.0
+soundfile==0.12.1
+python-multipart==0.0.20
+loguru==0.7.0

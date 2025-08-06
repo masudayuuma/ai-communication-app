@@ -1,471 +1,282 @@
-"""FastAPI backend for AI Communication App."""
+"""
+統合APIゲートウェイ - マイクロサービス連携
+要件定義書準拠: FastAPI + Redis Streams
+"""
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-import speech_recognition as sr
-import pyttsx3
-import requests
-import io
-import tempfile
-import os
-import threading
-import time
-from typing import Optional, List
-import base64
 import asyncio
+import time
+from typing import Dict, List, Optional
+import logging
 from datetime import datetime
-from pydub import AudioSegment
-from pydub.utils import which
 
-app = FastAPI(title="AI Communication API", version="1.0.0")
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+import redis.asyncio as redis
+import httpx
+from loguru import logger
+from prometheus_client import Counter, Histogram, generate_latest
+
+# FastAPI アプリケーション
+app = FastAPI(
+    title="AI English Conversation Gateway",
+    description="マイクロサービス統合API - 要件定義書準拠",
+    version="1.0.0"
+)
 
 # CORS設定
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:3002", "http://127.0.0.1:3002"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pydanticモデル
-class TextInput(BaseModel):
-    text: str
-
-class ChatResponse(BaseModel):
-    success: bool
-    message: str
-    response: Optional[str] = None
-    timestamp: str
-
-class TTSRequest(BaseModel):
-    text: str
-
-class SystemStatus(BaseModel):
-    ollama_connected: bool
-    microphone_available: bool
-    speaker_available: bool
-    available_voices: int
-    available_microphones: int
-
 # グローバル変数
-conversation_history = []
-tts_engine = None
+redis_client: Optional[redis.Redis] = None
 
-def init_tts_engine():
-    """TTS engine を初期化"""
-    global tts_engine
-    try:
-        tts_engine = pyttsx3.init()
-        voices = tts_engine.getProperty('voices')
-        if voices:
-            for voice in voices:
-                if 'english' in voice.name.lower() or 'en_' in voice.id.lower():
-                    tts_engine.setProperty('voice', voice.id)
-                    break
-        tts_engine.setProperty('rate', 180)
-        tts_engine.setProperty('volume', 0.9)
-        return True
-    except Exception as e:
-        print(f"TTS初期化エラー: {e}")
-        return False
+# 設定
+REDIS_URL = "redis://redis:6379"
+WHISPER_SERVICE_URL = "http://whisper:8001"
+LLM_SERVICE_URL = "http://llm:8002"
+TTS_SERVICE_URL = "http://tts:8003"
 
-def test_ollama_connection():
-    """Ollama API接続テスト"""
-    try:
-        response = requests.get("http://localhost:11434/api/tags", timeout=5)
-        return response.status_code == 200, response.json() if response.status_code == 200 else None
-    except Exception as e:
-        return False, str(e)
-
-def generate_ollama_response(prompt: str):
-    """Ollama APIで応答生成"""
-    try:
-        data = {
-            "model": "llama3:8b",
-            "prompt": prompt,
-            "stream": False
-        }
-        response = requests.post("http://localhost:11434/api/generate", json=data, timeout=30)
-        if response.status_code == 200:
-            return True, response.json().get("response", "")
-        else:
-            return False, f"HTTP {response.status_code}"
-    except Exception as e:
-        return False, str(e)
-
-def convert_audio_to_wav(input_path: str, output_path: str):
-    """音声ファイルをWAV形式に変換"""
-    try:
-        # 様々な形式の音声ファイルを読み込み
-        audio = AudioSegment.from_file(input_path)
-        
-        # WAV形式で出力 (16kHz, モノラル, 16bit)
-        audio = audio.set_frame_rate(16000).set_channels(1)
-        audio.export(output_path, format="wav")
-        return True
-    except Exception as e:
-        print(f"音声変換エラー: {e}")
-        # フォールバック: ファイルをそのままコピー
-        try:
-            import shutil
-            shutil.copy2(input_path, output_path)
-            print(f"フォールバック: ファイルを直接コピーしました")
-            return True
-        except Exception as copy_error:
-            print(f"ファイルコピーエラー: {copy_error}")
-            return False
+# Prometheus メトリクス
+request_count = Counter('requests_total', 'Total requests', ['method', 'endpoint'])
+request_duration = Histogram('request_duration_seconds', 'Request duration')
+pipeline_duration = Histogram('pipeline_duration_seconds', 'Pipeline processing time', ['stage'])
 
 @app.on_event("startup")
 async def startup_event():
-    """アプリ起動時の初期化"""
-    init_tts_engine()
-    print("🚀 FastAPI サーバーが起動しました")
+    """アプリケーション起動時の初期化"""
+    global redis_client
+    
+    logger.info("🚀 AI Conversation Gateway 起動中...")
+    
+    # Redis接続
+    try:
+        redis_client = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+        await redis_client.ping()
+        logger.info("✅ Redis 接続成功")
+    except Exception as e:
+        logger.error(f"❌ Redis 接続失敗: {e}")
+        raise
+    
+    logger.info("🎉 AI Conversation Gateway 初期化完了")
 
-@app.get("/")
-async def root():
-    """ルートエンドポイント"""
-    return {"message": "AI Communication API", "status": "running"}
+@app.on_event("shutdown")
+async def shutdown_event():
+    """アプリケーション終了時のクリーンアップ"""
+    global redis_client
+    if redis_client:
+        await redis_client.close()
+    logger.info("👋 AI Conversation Gateway 終了")
+
+# API エンドポイント
 
 @app.get("/health")
 async def health_check():
-    """ヘルスチェック"""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-@app.get("/system/status", response_model=SystemStatus)
-async def get_system_status():
-    """システム状態確認"""
-    # Ollama接続確認
-    ollama_connected, _ = test_ollama_connection()
+    """システム健全性チェック - 要件定義書準拠"""
+    services_status = {}
     
-    # マイク確認
-    microphone_available = False
-    mic_count = 0
-    try:
-        mic_list = sr.Microphone.list_microphone_names()
-        mic_count = len(mic_list)
-        microphone_available = mic_count > 0
-    except:
-        pass
+    # 各マイクロサービスの状態確認
+    services = {
+        "whisper": WHISPER_SERVICE_URL,
+        "llm": LLM_SERVICE_URL,
+        "tts": TTS_SERVICE_URL
+    }
     
-    # スピーカー・音声確認
-    speaker_available = tts_engine is not None
-    voice_count = 0
-    try:
-        if tts_engine:
-            voices = tts_engine.getProperty('voices')
-            voice_count = len(voices) if voices else 0
-    except:
-        pass
-    
-    return SystemStatus(
-        ollama_connected=ollama_connected,
-        microphone_available=microphone_available,
-        speaker_available=speaker_available,
-        available_voices=voice_count,
-        available_microphones=mic_count
-    )
-
-@app.post("/chat/text", response_model=ChatResponse)
-async def chat_with_text(input_data: TextInput):
-    """テキストでAIと会話"""
-    try:
-        success, response = generate_ollama_response(input_data.text)
-        
-        if success:
-            # 会話履歴に追加
-            conversation_entry = {
-                "user": input_data.text,
-                "ai": response,
-                "timestamp": datetime.now().isoformat()
-            }
-            conversation_history.append(conversation_entry)
-            
-            return ChatResponse(
-                success=True,
-                message="応答生成成功",
-                response=response,
-                timestamp=datetime.now().isoformat()
-            )
-        else:
-            return ChatResponse(
-                success=False,
-                message=f"AI応答エラー: {response}",
-                timestamp=datetime.now().isoformat()
-            )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"内部エラー: {str(e)}")
-
-@app.post("/speech/recognize")
-async def recognize_speech(audio_file: UploadFile = File(...)):
-    """音声認識"""
-    try:
-        # ファイル拡張子を判定
-        file_extension = ".webm"  # デフォルト
-        if audio_file.filename:
-            if audio_file.filename.endswith('.mp4'):
-                file_extension = ".mp4"
-            elif audio_file.filename.endswith('.ogg'):
-                file_extension = ".ogg"
-            elif audio_file.filename.endswith('.wav'):
-                file_extension = ".wav"
-        
-        # アップロードされた音声ファイルを一時保存
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
-            content = await audio_file.read()
-            temp_file.write(content)
-            temp_path = temp_file.name
-        
-        # WAV形式に変換
-        wav_path = temp_path.replace(file_extension, '.wav')
-        
+    for service_name, service_url in services.items():
         try:
-            # WAVファイルの場合は変換をスキップ
-            if file_extension == '.wav':
-                wav_path = temp_path
-                print(f"WAVファイルを直接使用: {wav_path}")
-            else:
-                # 他の形式の場合はWAV形式に変換
-                if not convert_audio_to_wav(temp_path, wav_path):
-                    return {
-                        "success": False,
-                        "text": "",
-                        "message": "音声ファイルの変換に失敗しました"
-                    }
-            
-            # 音声認識実行
-            r = sr.Recognizer()
-            with sr.AudioFile(wav_path) as source:
-                audio = r.record(source)
-                text = r.recognize_google(audio, language="en-US")
-                
-                return {
-                    "success": True,
-                    "text": text,
-                    "message": "音声認識成功"
-                }
-        
-        except sr.UnknownValueError:
-            return {
-                "success": False,
-                "text": "",
-                "message": "音声を認識できませんでした"
-            }
-        except sr.RequestError as e:
-            return {
-                "success": False,
-                "text": "",
-                "message": f"音声認識サービスエラー: {e}"
-            }
-        finally:
-            # WAVファイルを直接使用した場合は重複削除を避ける
-            paths_to_delete = [temp_path] if file_extension == '.wav' else [temp_path, wav_path]
-            for path in paths_to_delete:
-                if os.path.exists(path):
-                    os.unlink(path)
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"{service_url}/health", timeout=5.0)
+                services_status[service_name] = response.status_code == 200
+        except:
+            services_status[service_name] = False
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"音声認識エラー: {str(e)}")
-
-@app.post("/speech/synthesize")
-async def synthesize_speech(tts_request: TTSRequest):
-    """音声合成"""
+    # Redis状態確認
     try:
-        if not tts_engine:
-            raise HTTPException(status_code=500, detail="TTS engine が初期化されていません")
-        
-        # 一時ファイルに音声を保存
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
-            temp_path = temp_file.name
-        
-        # 音声合成実行
-        tts_engine.save_to_file(tts_request.text, temp_path)
-        tts_engine.runAndWait()
-        
-        # ファイルが作成されるまで少し待つ
-        await asyncio.sleep(0.5)
-        
-        if os.path.exists(temp_path):
-            return FileResponse(
-                temp_path,
-                media_type="audio/wav",
-                filename="speech.wav",
-                background=lambda: os.unlink(temp_path) if os.path.exists(temp_path) else None
-            )
-        else:
-            raise HTTPException(status_code=500, detail="音声ファイルの生成に失敗しました")
+        await redis_client.ping()
+        services_status["redis"] = True
+    except:
+        services_status["redis"] = False
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"音声合成エラー: {str(e)}")
-
-@app.post("/speech/chat")
-async def speech_chat(audio_file: UploadFile = File(...)):
-    """音声入力→AI応答→音声出力の一括処理"""
-    try:
-        print(f"音声ファイル受信: filename={audio_file.filename}, content_type={audio_file.content_type}")
-        
-        # ファイル拡張子を判定
-        file_extension = ".webm"  # デフォルト
-        if audio_file.filename:
-            if audio_file.filename.endswith('.mp4'):
-                file_extension = ".mp4"
-            elif audio_file.filename.endswith('.ogg'):
-                file_extension = ".ogg"
-            elif audio_file.filename.endswith('.wav'):
-                file_extension = ".wav"
-        
-        print(f"使用する拡張子: {file_extension}")
-        
-        # 1. 音声認識
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
-            content = await audio_file.read()
-            temp_file.write(content)
-            temp_path = temp_file.name
-        
-        print(f"一時ファイル作成: {temp_path}, サイズ: {len(content)} bytes")
-        
-        # WAV形式に変換
-        wav_path = temp_path.replace(file_extension, '.wav')
-        
-        try:
-            # WAVファイルの場合は変換をスキップ
-            if file_extension == '.wav':
-                wav_path = temp_path
-                print(f"WAVファイルを直接使用: {wav_path}")
-            else:
-                # 他の形式の場合はWAV形式に変換
-                print(f"音声変換開始: {temp_path} -> {wav_path}")
-                if not convert_audio_to_wav(temp_path, wav_path):
-                    raise HTTPException(status_code=500, detail="音声ファイルの変換に失敗しました")
-                print(f"音声変換完了")
-            
-            print(f"音声認識開始")
-            r = sr.Recognizer()
-            with sr.AudioFile(wav_path) as source:
-                audio = r.record(source)
-                user_text = r.recognize_google(audio, language="en-US")
-                print(f"音声認識結果: {user_text}")
-        finally:
-            # WAVファイルを直接使用した場合は重複削除を避ける
-            paths_to_delete = [temp_path] if file_extension == '.wav' else [temp_path, wav_path]
-            for path in paths_to_delete:
-                if os.path.exists(path):
-                    print(f"一時ファイル削除: {path}")
-                    os.unlink(path)
-        
-        # 2. AI応答生成
-        success, ai_response = generate_ollama_response(user_text)
-        
-        if not success:
-            raise HTTPException(status_code=500, detail=f"AI応答エラー: {ai_response}")
-        
-        # 3. 会話履歴に追加
-        conversation_entry = {
-            "user": user_text,
-            "ai": ai_response,
-            "timestamp": datetime.now().isoformat()
-        }
-        conversation_history.append(conversation_entry)
-        
-        # 4. 音声合成
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
-            audio_temp_path = temp_file.name
-        
-        tts_engine.save_to_file(ai_response, audio_temp_path)
-        tts_engine.runAndWait()
-        
-        await asyncio.sleep(0.5)
-        
-        return {
-            "success": True,
-            "user_text": user_text,
-            "ai_response": ai_response,
-            "audio_url": f"/download/audio/{os.path.basename(audio_temp_path)}",
-            "timestamp": datetime.now().isoformat()
-        }
-    
-    except sr.UnknownValueError:
-        raise HTTPException(status_code=400, detail="音声を認識できませんでした")
-    except sr.RequestError as e:
-        raise HTTPException(status_code=500, detail=f"音声認識サービスエラー: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"音声チャットエラー: {str(e)}")
-
-@app.get("/conversation/history")
-async def get_conversation_history():
-    """会話履歴取得"""
     return {
-        "conversations": conversation_history,
-        "total": len(conversation_history)
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "services": services_status
     }
 
-@app.delete("/conversation/history")
-async def clear_conversation_history():
-    """会話履歴クリア"""
-    global conversation_history
-    conversation_history = []
-    return {"message": "会話履歴をクリアしました"}
+@app.get("/metrics")
+async def metrics():
+    """Prometheus メトリクス - 要件定義書準拠"""
+    return Response(generate_latest(), media_type="text/plain")
 
-@app.get("/test/microphone")
-async def test_microphone():
-    """マイクテスト"""
-    try:
-        mic_list = sr.Microphone.list_microphone_names()
-        return {
-            "success": True,
-            "microphones": mic_list,
-            "count": len(mic_list)
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-@app.get("/test/speaker")
-async def test_speaker():
-    """スピーカーテスト"""
-    try:
-        test_text = "This is a speaker test. Hello from the AI Communication API."
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
-            temp_path = temp_file.name
-        
-        tts_engine.save_to_file(test_text, temp_path)
-        tts_engine.runAndWait()
-        
-        await asyncio.sleep(0.5)
-        
-        if os.path.exists(temp_path):
-            return FileResponse(
-                temp_path,
-                media_type="audio/wav",
-                filename="speaker_test.wav",
-                background=lambda: os.unlink(temp_path) if os.path.exists(temp_path) else None
-            )
-        else:
-            raise HTTPException(status_code=500, detail="テスト音声の生成に失敗しました")
+@app.post("/chat/text")
+async def chat_text(request: dict):
+    """テキストベースの会話 - LLMサービス直接呼び出し"""
+    request_count.labels(method="POST", endpoint="/chat/text").inc()
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"スピーカーテストエラー: {str(e)}")
-
-@app.post("/test/upload")
-async def test_upload(audio_file: UploadFile = File(...)):
-    """音声ファイルアップロードテスト"""
     try:
-        content = await audio_file.read()
-        return {
-            "filename": audio_file.filename,
-            "content_type": audio_file.content_type,
-            "size": len(content),
-            "message": "ファイルアップロード成功"
-        }
+        with request_duration.time():
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{LLM_SERVICE_URL}/generate",
+                    json=request,
+                    timeout=10.0  # 10秒に短縮
+                )
+                
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    raise HTTPException(status_code=response.status_code, detail="LLMサービスエラー")
+                    
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"アップロードテストエラー: {str(e)}")
+        logger.error(f"❌ テキストチャットエラー: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/speech/chat")
+async def speech_chat(audio_file: UploadFile = File(...)):
+    """
+    音声ベースの会話 - Redis Streams パイプライン
+    要件定義書の音声処理フローに準拠
+    """
+    request_count.labels(method="POST", endpoint="/speech/chat").inc()
+    start_time = time.time()
+    
+    try:
+        with request_duration.time():
+            # Step 1: Whisper ASRサービスで音声認識
+            with pipeline_duration.labels(stage="asr").time():
+                content = await audio_file.read()
+                
+                async with httpx.AsyncClient() as client:
+                    files = {"audio_file": ("audio.wav", content, "audio/wav")}
+                    asr_response = await client.post(
+                        f"{WHISPER_SERVICE_URL}/transcribe",
+                        files=files,
+                        timeout=25.0  # 音声認識用に25秒に延長
+                    )
+                    
+                    if asr_response.status_code != 200:
+                        raise HTTPException(status_code=500, detail="音声認識に失敗しました")
+                    
+                    asr_result = asr_response.json()
+                    user_text = asr_result.get("transcript", "")
+            
+            if not user_text.strip():
+                logger.warning("⚠️ 音声認識結果が空 - デフォルトメッセージで応答")
+                return {
+                    "transcription": "",
+                    "response": "Sorry, I couldn't hear you clearly. Could you please try again?",
+                    "user_text": "",  # 下位互換
+                    "ai_response": "Sorry, I couldn't hear you clearly. Could you please try again?",  # 下位互換
+                    "conversation_history": [],
+                    "asr_confidence": 0.0,
+                    "processing_time": time.time() - start_time
+                }
+            
+            # Step 2: LLMサービスで応答生成
+            with pipeline_duration.labels(stage="llm").time():
+                async with httpx.AsyncClient() as client:
+                    llm_response = await client.post(
+                        f"{LLM_SERVICE_URL}/generate",
+                        json={"text": user_text},
+                        timeout=15.0  # 15秒に短縮
+                    )
+                    
+                    if llm_response.status_code != 200:
+                        raise HTTPException(status_code=500, detail="LLM応答生成に失敗しました")
+                    
+                    llm_result = llm_response.json()
+                    ai_response = llm_result.get("response", "")
+            
+            # Step 3: TTSサービスで音声合成
+            with pipeline_duration.labels(stage="tts").time():
+                async with httpx.AsyncClient() as client:
+                    tts_response = await client.post(
+                        f"{TTS_SERVICE_URL}/synthesize",
+                        json={"text": ai_response},
+                        timeout=15.0  # 15秒に短縮
+                    )
+                    
+                    if tts_response.status_code != 200:
+                        logger.warning("TTS失敗 - テキストのみ返却")
+                        tts_audio = None
+                    else:
+                        tts_audio = tts_response.content
+            
+            # 結果返却（フロントエンド互換形式）
+            result = {
+                "transcription": user_text,
+                "response": ai_response,
+                "user_text": user_text,  # 下位互換
+                "ai_response": ai_response,  # 下位互換
+                "conversation_history": llm_result.get("conversation_history", []),
+                "asr_confidence": asr_result.get("confidence", 0.0),
+                "processing_time": time.time() - start_time
+            }
+            
+            logger.info(f"音声会話完了: {user_text[:30]}... → {ai_response[:30]}...")
+            return result
+            
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        logger.error(f"❌ 音声会話エラー: {e}")
+        logger.error(f"詳細なエラートレース: {error_details}")
+        raise HTTPException(status_code=500, detail=f"音声処理エラー: {str(e)}")
+
+@app.post("/api/speech/synthesize")
+async def synthesize_speech(request: dict):
+    """テキスト音声合成 - TTSサービス呼び出し"""
+    request_count.labels(method="POST", endpoint="/speech/synthesize").inc()
+    
+    try:
+        with request_duration.time():
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{TTS_SERVICE_URL}/synthesize",
+                    json=request,
+                    timeout=10.0  # 10秒に短縮
+                )
+                
+                if response.status_code == 200:
+                    return Response(
+                        content=response.content,
+                        media_type="audio/wav",
+                        headers={"Content-Disposition": "attachment; filename=speech.wav"}
+                    )
+                else:
+                    raise HTTPException(status_code=response.status_code, detail="TTS生成エラー")
+                    
+    except Exception as e:
+        logger.error(f"❌ 音声合成エラー: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/conversation/reset")
+async def reset_conversation():
+    """会話履歴リセット"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(f"{LLM_SERVICE_URL}/reset", timeout=10.0)
+            
+            if response.status_code == 200:
+                return {"message": "会話履歴をリセットしました"}
+            else:
+                raise HTTPException(status_code=500, detail="リセットに失敗しました")
+                
+    except Exception as e:
+        logger.error(f"❌ 会話リセットエラー: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Redis Streams 監視（将来のWebSocket実装用）
+async def monitor_streams():
+    """Redis Streamsの監視（WebSocket実装時に使用）"""
+    logger.info("📡 Redis Streams 監視開始")
+    # 将来のWebSocket実装時に使用
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

@@ -1,168 +1,183 @@
-version: '3.8'
+# version: '3.9'  # obsolete attribute removed
 
 services:
-  # AI Communication App with GPU support
-  ai-communication-gpu:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        BUILD_TARGET: gpu-base
-    container_name: ai-communication-gpu
-    ports:
-      - "8501:8501"
-    volumes:
-      - model-cache:/root/.cache
-      - ./logs:/app/logs
-    environment:
-      - MODEL_CACHE_DIR=/root/.cache/ai_communication_app
-      - HF_HOME=/root/.cache/huggingface
-      - TORCH_HOME=/root/.cache/torch
-      - CUDA_VISIBLE_DEVICES=0
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    restart: unless-stopped
-    profiles:
-      - gpu
-
-  # AI Communication App with CPU only
-  ai-communication-cpu:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        BUILD_TARGET: cpu-base
-    container_name: ai-communication-cpu
-    ports:
-      - "8502:8501"
-    volumes:
-      - model-cache:/root/.cache
-      - ./logs:/app/logs
-    environment:
-      - MODEL_CACHE_DIR=/root/.cache/ai_communication_app
-      - HF_HOME=/root/.cache/huggingface
-      - TORCH_HOME=/root/.cache/torch
-    restart: unless-stopped
-    profiles:
-      - cpu
-
-  # Ollama service for LLM inference
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama-data:/root/.ollama
-    environment:
-      - OLLAMA_ORIGINS=*
-    restart: unless-stopped
-    # Uncomment for GPU support
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
-
-  # Nginx reverse proxy (optional)
-  nginx:
-    image: nginx:alpine
-    container_name: ai-communication-nginx
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./ssl:/etc/nginx/ssl:ro
-    depends_on:
-      - ai-communication-gpu
-      - ollama
-    restart: unless-stopped
-    profiles:
-      - nginx
-
-  # Redis for session management (optional)
+  # Redis - 音声・テキストパイプライン (Redis Streams)
   redis:
-    image: redis:alpine
-    container_name: ai-communication-redis
+    image: redis:7-alpine
+    container_name: ai-chat-redis
     ports:
       - "6379:6379"
+    command: redis-server --appendonly yes
     volumes:
-      - redis-data:/data
+      - redis_data:/data
+    networks:
+      - ai-chat
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
-    profiles:
-      - redis
 
-  # PostgreSQL for conversation storage (optional)
-  postgres:
-    image: postgres:15-alpine
-    container_name: ai-communication-postgres
+  # Whisper ASRサービス - faster-whisper使用
+  whisper:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.whisper
+    container_name: ai-chat-whisper
     ports:
-      - "5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - "8001:8001"
+    depends_on:
+      redis:
+        condition: service_healthy
     environment:
-      - POSTGRES_DB=ai_communication
-      - POSTGRES_USER=app_user
-      - POSTGRES_PASSWORD=secure_password_here
+      - REDIS_URL=redis://redis:6379
+      - WHISPER_MODEL_SIZE=base
+      - DEVICE=cpu
+    volumes:
+      - whisper_models:/models
+      - ./services/whisper:/app
+    networks:
+      - ai-chat
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
     restart: unless-stopped
-    profiles:
-      - database
 
-  # Monitoring with Prometheus (optional)
+  # Llama-3 LLMサービス - Ollama統合
+  llm:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.llm
+    container_name: ai-chat-llm
+    ports:
+      - "8002:8002"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - OLLAMA_HOST=0.0.0.0:11434
+    volumes:
+      - llm_models:/root/.ollama
+      - ./services/llm:/app
+    networks:
+      - ai-chat
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 180s
+    restart: unless-stopped
+
+  # XTTS-v2 TTSサービス - Coqui XTTS使用
+  tts:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.tts
+    container_name: ai-chat-tts
+    ports:
+      - "8003:8003"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DEVICE=cpu
+    volumes:
+      - tts_models:/models
+      - ./services/tts:/app
+    networks:
+      - ai-chat
+    restart: unless-stopped
+
+  # FastAPI Backend - 統合APIゲートウェイ
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: ai-chat-backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      whisper:
+        condition: service_healthy
+      llm:
+        condition: service_healthy
+      tts:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - WHISPER_SERVICE_URL=http://whisper:8001
+      - LLM_SERVICE_URL=http://llm:8002
+      - TTS_SERVICE_URL=http://tts:8003
+      - LOG_LEVEL=INFO
+      - PYTHONPATH=/app
+    volumes:
+      - ./backend:/app/backend
+      - ./logs:/app/logs
+    networks:
+      - ai-chat
+    restart: unless-stopped
+
+  # Next.js Frontend - リアルタイムUI
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    container_name: ai-chat-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NODE_ENV=production
+      - NEXT_TELEMETRY_DISABLED=1
+    networks:
+      - ai-chat
+    restart: unless-stopped
+
+  # Prometheus - メトリクス収集 (開発時用)
   prometheus:
     image: prom/prometheus:latest
-    container_name: ai-communication-prometheus
+    container_name: ai-chat-prometheus
     ports:
       - "9090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
+      - prometheus_data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
       - '--web.console.libraries=/etc/prometheus/console_libraries'
       - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - ai-chat
     restart: unless-stopped
     profiles:
       - monitoring
-
-  # Grafana for visualization (optional)
-  grafana:
-    image: grafana/grafana:latest
-    container_name: ai-communication-grafana
-    ports:
-      - "3000:3000"
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - ./monitoring/grafana:/etc/grafana/provisioning
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    restart: unless-stopped
-    profiles:
-      - monitoring
-
-volumes:
-  model-cache:
-    driver: local
-  ollama-data:
-    driver: local
-  redis-data:
-    driver: local
-  postgres-data:
-    driver: local
-  prometheus-data:
-    driver: local
-  grafana-data:
-    driver: local
 
 networks:
-  default:
-    name: ai-communication-network
+  ai-chat:
+    driver: bridge
+    name: ai-chat-network
+
+volumes:
+  redis_data:
+    driver: local
+  whisper_models:
+    driver: local
+  llm_models:
+    driver: local
+  tts_models:
+    driver: local
+  prometheus_data:
+    driver: local

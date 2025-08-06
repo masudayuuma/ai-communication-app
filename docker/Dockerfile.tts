@@ -1,0 +1,28 @@
+# Piper TTSサービス用 Dockerfile
+FROM python:3.11-slim
+
+# Python環境設定
+RUN pip install --upgrade pip
+
+# 作業ディレクトリ
+WORKDIR /app
+
+# TTS関連の依存関係
+COPY requirements/tts.txt /app/requirements.txt
+RUN pip install -r requirements.txt
+
+# アプリケーションコードをコピー
+COPY services/tts/ /app/
+
+# モデルディレクトリ作成
+RUN mkdir -p /models
+
+# ポート開放
+EXPOSE 8003
+
+# ヘルスチェック（起動時間を長くしてモデルダウンロードに対応）
+HEALTHCHECK --interval=30s --timeout=15s --start-period=180s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:8003/health')" || exit 1
+
+# アプリケーション起動
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8003"]

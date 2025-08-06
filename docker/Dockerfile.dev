@@ -1,0 +1,24 @@
+# Development Dockerfile - ホットリロード対応
+FROM python:3.11-slim
+
+# 開発用ツール
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    inotify-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ファイル監視スクリプト
+COPY <<EOF /usr/local/bin/watch-changes.sh
+#!/bin/bash
+echo "🔍 ファイル変更を監視中..."
+inotifywait -mr --format '%w%f %e' -e modify,create,delete,move /app/backend /app/frontend | while read file event; do
+    echo "📝 変更検出: \$file (\$event)"
+done
+EOF
+
+RUN chmod +x /usr/local/bin/watch-changes.sh
+
+CMD ["/usr/local/bin/watch-changes.sh"]

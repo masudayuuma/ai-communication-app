@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Test - AI English Conversation</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .section { margin: 20px 0; padding: 20px; border: 1px solid #ccc; }
+        button { padding: 10px 20px; margin: 5px; }
+        .status { padding: 10px; margin: 10px 0; }
+        .success { background: #d4edda; color: #155724; }
+        .error { background: #f8d7da; color: #721c24; }
+        pre { background: #f8f9fa; padding: 10px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>🧪 API Test Suite</h1>
+    
+    <div class="section">
+        <h2>1. バックエンドヘルスチェック</h2>
+        <button onclick="testHealthCheck()">Health Check</button>
+        <div id="health-result"></div>
+    </div>
+    
+    <div class="section">
+        <h2>2. TTS音声合成テスト</h2>
+        <input type="text" id="tts-text" value="Hello, this is a test" style="width: 300px;">
+        <button onclick="testTTS()">音声合成テスト</button>
+        <div id="tts-result"></div>
+        <audio id="tts-audio" controls style="display: none;"></audio>
+    </div>
+    
+    <div class="section">
+        <h2>3. 音声録音・会話テスト</h2>
+        <button id="record-btn" onclick="toggleRecording()">🎤 録音開始</button>
+        <div id="record-result"></div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8000';
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+
+        // ヘルスチェック
+        async function testHealthCheck() {
+            const resultDiv = document.getElementById('health-result');
+            try {
+                const response = await fetch(`${API_BASE}/health`);
+                const data = await response.json();
+                
+                resultDiv.innerHTML = `
+                    <div class="status success">
+                        <strong>✅ 接続成功</strong>
+                        <pre>${JSON.stringify(data, null, 2)}</pre>
+                    </div>
+                `;
+            } catch (error) {
+                resultDiv.innerHTML = `
+                    <div class="status error">
+                        <strong>❌ 接続失敗:</strong> ${error.message}
+                    </div>
+                `;
+            }
+        }
+
+        // TTS テスト
+        async function testTTS() {
+            const text = document.getElementById('tts-text').value;
+            const resultDiv = document.getElementById('tts-result');
+            const audioElement = document.getElementById('tts-audio');
+            
+            try {
+                resultDiv.innerHTML = '<div class="status">🤖 音声合成中...</div>';
+                
+                const response = await fetch(`${API_BASE}/api/speech/synthesize`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text })
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                
+                const audioBlob = await response.blob();
+                const audioUrl = URL.createObjectURL(audioBlob);
+                
+                audioElement.src = audioUrl;
+                audioElement.style.display = 'block';
+                
+                resultDiv.innerHTML = `
+                    <div class="status success">
+                        <strong>✅ 音声合成成功</strong><br>
+                        サイズ: ${audioBlob.size} bytes
+                    </div>
+                `;
+                
+            } catch (error) {
+                resultDiv.innerHTML = `
+                    <div class="status error">
+                        <strong>❌ 音声合成失敗:</strong> ${error.message}
+                    </div>
+                `;
+            }
+        }
+
+        // 録音テスト
+        async function toggleRecording() {
+            const btn = document.getElementById('record-btn');
+            const resultDiv = document.getElementById('record-result');
+            
+            if (!isRecording) {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    mediaRecorder = new MediaRecorder(stream);
+                    audioChunks = [];
+                    
+                    mediaRecorder.ondataavailable = (event) => {
+                        audioChunks.push(event.data);
+                    };
+                    
+                    mediaRecorder.onstop = async () => {
+                        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                        await testSpeechChat(audioBlob);
+                    };
+                    
+                    mediaRecorder.start();
+                    isRecording = true;
+                    btn.textContent = '⏹️ 録音停止';
+                    btn.style.background = '#dc3545';
+                    
+                    resultDiv.innerHTML = '<div class="status">🎤 録音中...</div>';
+                    
+                } catch (error) {
+                    resultDiv.innerHTML = `
+                        <div class="status error">
+                            <strong>❌ マイクアクセス失敗:</strong> ${error.message}
+                        </div>
+                    `;
+                }
+            } else {
+                mediaRecorder.stop();
+                isRecording = false;
+                btn.textContent = '🎤 録音開始';
+                btn.style.background = '';
+                
+                // ストリームを停止
+                mediaRecorder.stream.getTracks().forEach(track => track.stop());
+            }
+        }
+
+        // 音声会話テスト
+        async function testSpeechChat(audioBlob) {
+            const resultDiv = document.getElementById('record-result');
+            
+            try {
+                resultDiv.innerHTML = '<div class="status">🤖 音声処理中...</div>';
+                
+                const formData = new FormData();
+                formData.append('audio_file', audioBlob, 'recording.wav');
+                
+                const response = await fetch(`${API_BASE}/api/speech/chat`, {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                
+                const result = await response.json();
+                
+                resultDiv.innerHTML = `
+                    <div class="status success">
+                        <strong>✅ 音声会話成功</strong>
+                        <pre>${JSON.stringify(result, null, 2)}</pre>
+                    </div>
+                `;
+                
+            } catch (error) {
+                resultDiv.innerHTML = `
+                    <div class="status error">
+                        <strong>❌ 音声会話失敗:</strong> ${error.message}
+                    </div>
+                `;
+            }
+        }
+
+        // 初期テスト実行
+        window.onload = () => {
+            testHealthCheck();
+        };
+    </script>
+</body>
+</html>

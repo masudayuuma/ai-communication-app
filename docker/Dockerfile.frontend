@@ -1,0 +1,32 @@
+# Next.js Frontend Dockerfile - リアルタイム音声UI
+FROM node:20-alpine
+
+# システム依存関係
+RUN apk add --no-cache git curl
+
+WORKDIR /app
+
+# package.jsonをコピーして依存関係インストール
+COPY frontend/package*.json ./
+RUN npm install && npm cache clean --force
+
+# フロントエンドコードをコピー
+COPY frontend/ ./
+
+# 環境変数設定
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV NEXT_PUBLIC_API_URL=http://localhost:8000
+
+# Next.js アプリケーションビルド
+RUN npm run build
+
+# ポート公開
+EXPOSE 3000
+
+# ヘルスチェック
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:3000 || exit 1
+
+# 本番モードで起動
+CMD ["npm", "start"]

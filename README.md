@@ -326,3 +326,14 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 **⚡ Ready to practice English conversation with AI? Get started in minutes!**
+
+
+
+
+
+
+
+Phi-3 miniにモデルを切り替える
+macはdocker経由でgpu使えない。ローカルからしか無理っぽい
+Llama3はローカルやといいけどdocker経由やと遅い
+baseモデルのwhisperなかなかいい、早い
